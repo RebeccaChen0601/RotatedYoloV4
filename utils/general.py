@@ -34,6 +34,7 @@ matplotlib.rc('font', **{'size': 11})
 # Prevent OpenCV from multithreading (to use PyTorch DataLoader)
 cv2.setNumThreads(0)
 
+
 def get_rotated_coors(box):
     assert len(box) > 0 , 'Input valid box!'
     cx = box[0]; cy = box[1]; w = box[2]; h = box[3]; a = box[4]
@@ -95,7 +96,7 @@ def skewiou(box1, box2,mode='iou',return_coor = False):
         return 0
     else:
         if return_coor:
-            return inter/union,coors
+            return inter/union,coors # check if caller set 'iou' mode alwaus to 'return coord' to false 
         else:
             return inter/union
 
@@ -259,6 +260,26 @@ def xywh2xyxy(x):
     y[:, 3] = x[:, 1] + x[:, 3] / 2  # bottom right y
     return y
 
+def xywha2coors(x):
+    # 带旋转角度，顺时针正，+-0.5pi;返回四个点坐标
+    coors = []  ## 一张图的所有box
+    for obj in x:
+        cx = obj[0]; cy = obj[1]; w = obj[2]; h = obj[3]; a = obj[4]
+        xmin = cx - w*0.5; xmax = cx + w*0.5; ymin = cy - h*0.5; ymax = cy + h*0.5
+        t_x0=xmin; t_y0=ymin; t_x1=xmin; t_y1=ymax; t_x2=xmax; t_y2=ymax; t_x3=xmax; t_y3=ymin
+        R = np.eye(3)
+        R[:2] = cv2.getRotationMatrix2D(angle=-a*180/math.pi, center=(cx,cy), scale=1)
+        x0 = t_x0*R[0,0] + t_y0*R[0,1] + R[0,2] 
+        y0 = t_x0*R[1,0] + t_y0*R[1,1] + R[1,2] 
+        x1 = t_x1*R[0,0] + t_y1*R[0,1] + R[0,2] 
+        y1 = t_x1*R[1,0] + t_y1*R[1,1] + R[1,2] 
+        x2 = t_x2*R[0,0] + t_y2*R[0,1] + R[0,2] 
+        y2 = t_x2*R[1,0] + t_y2*R[1,1] + R[1,2] 
+        x3 = t_x3*R[0,0] + t_y3*R[0,1] + R[0,2] 
+        y3 = t_x3*R[1,0] + t_y3*R[1,1] + R[1,2] 
+        coors.append(np.array([[float(x0),float(y0)],[float(x1),float(y1)],[float(x2),float(y2)],[float(x3),float(y3)]]))
+    return coors
+
 
 def scale_coords(img1_shape, coords, img0_shape, ratio_pad=None):
     # Rescale coords (xyxy) from img1_shape to img0_shape
@@ -393,8 +414,8 @@ def skew_bbox_iou(box1, box2, GIoU=False):
     if not box1.shape == box2.shape:
         box1 = box1.repeat(len(box2),1)
 
-    box1 = box1[:,:5]
-    box2 = box2[:,:5]
+    box1 = box1[:5]
+    box2 = box2[:5]
 
     if GIoU: 
         mode = 'giou'
@@ -402,11 +423,14 @@ def skew_bbox_iou(box1, box2, GIoU=False):
         mode = 'iou'
     
     ious = []
-    for i in range(len(box2)):
-        r_b1 = get_rotated_coors(box1[i])
-        r_b2 = get_rotated_coors(box2[i])
+    # for i in range(len(box2)):
+    #     r_b1 = get_rotated_coors(box1[i]) 
+    #     r_b2 = get_rotated_coors(box2[i])
         
-        ious.append(skewiou(r_b1, r_b2, mode=mode))
+    # check how box1 is represented, what is passed as box1 in the called function 
+    r_b1 = get_rotated_coors(box1) 
+    r_b2 = get_rotated_coors(box2)
+    ious.append(skewiou(r_b1, r_b2, mode=mode))
 
     # if GIoU:  # Generalized IoU https://arxiv.org/pdf/1902.09630.pdf
     #     c_x1, c_x2 = torch.min(b1_x1, b2_x1), torch.max(b1_x2, b2_x2)
@@ -488,30 +512,87 @@ def box_iou(box1, box2):
     return inter / (area1[:, None] + area2 - inter)  # iou = inter / (area1 + area2 - inter)
 
 
-# def wh_iou(wh1, wh2):
-#     # Returns the nxm IoU matrix. wh1 is nx2, wh2 is mx2
-#     wh1 = wh1[:, None]  # [N,1,2]
-#     wh2 = wh2[None]  # [1,M,2]
-#     inter = torch.min(wh1, wh2).prod(2)  # [N,M]
-#     return inter / (wh1.prod(2) + wh2.prod(2) - inter)  # iou = inter / (area1 + area2 - inter)
+def wh_iou(wh1, wh2):
+    # Returns the nxm IoU matrix. wh1 is nx2, wh2 is mx2
+    wh1 = wh1[:, None]  # [N,1,2]
+    wh2 = wh2[None]  # [1,M,2]
+    inter = torch.min(wh1, wh2).prod(2)  # [N,M]
+    return inter / (wh1.prod(2) + wh2.prod(2) - inter)  # iou = inter / (area1 + area2 - inter)
 
-def wh_iou(box1, box2):
-    # Returns the IoU of wh1 to wh2. wh1 is 2, wh2 is nx2
-    if box1.shape != box2.shape:
-        box2 = box2.t()
-        # w, h = box1
-        w1, h1 = box1[0], box1[1]
-        w2, h2 = box2[0], box2[1]
-    else:
-        w1, h1 = box1[:,0], box1[:,1]
-        w2, h2 = box2[:,0], box2[:,1]
-    # Intersection area
-    inter_area = torch.min(w1, w2) * torch.min(h1, h2)
+# rotated_yolov3 version
+# def wh_iou(box1, box2):
+#     # Returns the IoU of wh1 to wh2. wh1 is 2, wh2 is nx2
+#     if box1.shape != box2.shape:
+#         box2 = box2.t()
+#         # w, h = box1
+#         w1, h1 = box1[0], box1[1]
+#         w2, h2 = box2[0], box2[1]
+#     else:
+#         w1, h1 = box1[:,0], box1[:,1]
+#         w2, h2 = box2[:,0], box2[:,1]
+#     # Intersection area
+#     inter_area = torch.min(w1, w2) * torch.min(h1, h2)
 
-    # Union Area
-    union_area = (w1 * h1 + 1e-16) + w2 * h2 - inter_area
-    return inter_area / union_area  # iou
-    
+#     # Union Area
+#     union_area = (w1 * h1 + 1e-16) + w2 * h2 - inter_area
+#     return inter_area / union_area  # iou
+
+
+# Plotting functions ---------------------------------------------------------------------------------------------------
+def plot_one_box(x, img, color=None, label=None, line_thickness=None):
+    # Plots one bounding box on image img
+    tl = line_thickness or round(0.002 * (img.shape[0] + img.shape[1]) / 2) + 1  # line thickness
+    color = color or [random.randint(0, 255) for _ in range(3)]
+    coor = torch.cuda.FloatTensor(get_rotated_coors(x)).reshape(4,2)
+    img = cv2.polylines(img, [coor.cpu().numpy().astype(np.int32)], True, color, tl)
+    if label:
+        tf = max(tl - 1, 1)  # font thickness
+        t_size = cv2.getTextSize(label, 0, fontScale=tl / 3, thickness=tf)[0]
+        label_coor = get_rotated_coors(torch.FloatTensor([coor[0,0], coor[0,1], t_size[0], t_size[1], x[-1]]))
+        # cv2.polylines(img,[label_coor.reshape(4,2).cpu().numpy().astype(np.int32)],True, color, tl)
+        cv2.putText(img, label, tuple(coor[0].cpu().numpy()) , 0, tl / 3, color, thickness=tf, lineType=cv2.LINE_AA)
+
+
+# 绘制斜框gt，看看增强是否有效，label是否加载正确
+def plot_images(imgs, targets, paths=None, fname='images.jpg'):
+    # Plots training images overlaid with targets
+    imgs = imgs.cpu().numpy()
+    targets = targets.cpu().numpy()
+    # targets = targets[targets[:, 1] == 21]  # plot only one class
+
+    fig = plt.figure(figsize=(10, 10))
+    bs, _, h, w = imgs.shape  # batch size, _, height, width
+    bs = min(bs, 16)  # limit plot to 16 images
+    ns = np.ceil(bs ** 0.5)  # number of subplots
+
+    for i in range(bs):
+        img = imgs[i]
+        img *= 255.0  # 从归一化的浮点数映射回原图便于opencv画多边形box（matplotlib本身可以用浮点画图）
+        img = np.ascontiguousarray(img, dtype=np.uint8)  
+        img = img.transpose(1,2,0)  # BGR to RGB, to 3x416x416
+        
+        boxes = xywha2coors(targets[targets[:, 0] == i, 2:7])
+        if len(boxes)>0:   # 不一定都有gt(增强后可能没了)
+            for box in boxes:
+                box[:,0]*=w; box[:,1]*=h
+                box = box.astype(np.int32)
+                r,g,b = (random.randint(0,255),random.randint(0,255),random.randint(0,255))
+
+                img = cv2.polylines(img,[box],True,(r,g,b),2)
+        else:
+            # cv2.imshow('p',img)
+            # cv2.waitKey(0)
+            continue
+        img = img.get().astype('i')
+        plt.subplot(ns, ns, i + 1).imshow(img)
+        plt.axis('off')
+        if paths is not None:
+            s = Path(paths[i]).name
+            plt.title(s[:min(len(s), 40)], fontdict={'size': 8})  # limit to 40 characters
+    fig.tight_layout()
+    fig.savefig(fname, dpi=200)
+    plt.close()
+
 class FocalLoss(nn.Module):
     # Wraps focal loss around existing loss_fcn(), i.e. criteria = FocalLoss(nn.BCEWithLogitsLoss(), gamma=1.5)
     def __init__(self, loss_fcn, gamma=1.5, alpha=0.25):

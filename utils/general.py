@@ -10,6 +10,8 @@ from copy import copy
 from pathlib import Path
 from sys import platform
 
+from shapely.geometry import Polygon,MultiPoint  
+from shapely.geometry import Polygon
 import cv2
 import matplotlib
 import matplotlib.pyplot as plt
@@ -32,6 +34,70 @@ matplotlib.rc('font', **{'size': 11})
 # Prevent OpenCV from multithreading (to use PyTorch DataLoader)
 cv2.setNumThreads(0)
 
+def get_rotated_coors(box):
+    assert len(box) > 0 , 'Input valid box!'
+    cx = box[0]; cy = box[1]; w = box[2]; h = box[3]; a = box[4]
+    xmin = cx - w*0.5; xmax = cx + w*0.5; ymin = cy - h*0.5; ymax = cy + h*0.5
+    t_x0=xmin; t_y0=ymin; t_x1=xmin; t_y1=ymax; t_x2=xmax; t_y2=ymax; t_x3=xmax; t_y3=ymin
+    R = np.eye(3)
+    R[:2] = cv2.getRotationMatrix2D(angle=-a*180/math.pi, center=(cx,cy), scale=1)
+    x0 = t_x0*R[0,0] + t_y0*R[0,1] + R[0,2] 
+    y0 = t_x0*R[1,0] + t_y0*R[1,1] + R[1,2] 
+    x1 = t_x1*R[0,0] + t_y1*R[0,1] + R[0,2] 
+    y1 = t_x1*R[1,0] + t_y1*R[1,1] + R[1,2] 
+    x2 = t_x2*R[0,0] + t_y2*R[0,1] + R[0,2] 
+    y2 = t_x2*R[1,0] + t_y2*R[1,1] + R[1,2] 
+    x3 = t_x3*R[0,0] + t_y3*R[0,1] + R[0,2] 
+    y3 = t_x3*R[1,0] + t_y3*R[1,1] + R[1,2] 
+
+    if isinstance(x0,torch.Tensor):
+        r_box=torch.cat([x0.unsqueeze(0),y0.unsqueeze(0),
+                         x1.unsqueeze(0),y1.unsqueeze(0),
+                         x2.unsqueeze(0),y2.unsqueeze(0),
+                         x3.unsqueeze(0),y3.unsqueeze(0)], 0)
+    else:
+        r_box = np.array([x0,y0,x1,y1,x2,y2,x3,y3])
+    return r_box
+
+
+# anchor对齐阶段计算iou
+def skewiou(box1, box2,mode='iou',return_coor = False):
+    a=box1.reshape(4, 2)   
+    b=box2.reshape(4, 2)
+    # 所有点的最小凸的表示形式，四边形对象，会自动计算四个点，最后顺序为：左上 左下  右下 右上 左上
+    poly1 = Polygon(a).convex_hull  
+    poly2 = Polygon(b).convex_hull
+    if not poly1.is_valid or not poly2.is_valid:
+        print('formatting errors for boxes!!!! ')
+        return 0
+    if  poly1.area == 0 or  poly2.area  == 0 :
+        return 0
+
+    inter = Polygon(poly1).intersection(Polygon(poly2)).area
+    if   mode == 'iou':
+        union = poly1.area + poly2.area - inter
+    elif mode =='tiou':
+        union_poly = np.concatenate((a,b))   #合并两个box坐标，变为8*2
+        union = MultiPoint(union_poly).convex_hull.area
+        coors = MultiPoint(union_poly).convex_hull.wkt
+    elif mode == 'giou':
+        union_poly = np.concatenate((a,b))   
+        union = MultiPoint(union_poly).envelope.area
+        coors = MultiPoint(union_poly).envelope.wkt
+    elif mode== 'r_giou':
+        union_poly = np.concatenate((a,b))   
+        union = MultiPoint(union_poly).minimum_rotated_rectangle.area
+        coors = MultiPoint(union_poly).minimum_rotated_rectangle.wkt
+    else:
+        print('incorrect mode!')
+
+    if union == 0:
+        return 0
+    else:
+        if return_coor:
+            return inter/union,coors
+        else:
+            return inter/union
 
 @contextmanager
 def torch_distributed_zero_first(local_rank: int):
@@ -142,9 +208,10 @@ def labels_to_class_weights(labels, nc=80):
     classes = labels[:, 0].astype(np.int)  # labels = [class xywh]
     weights = np.bincount(classes, minlength=nc)  # occurences per class
 
+    # uncommented for rotated_yolov4
     # Prepend gridpoint count (for uCE trianing)
-    # gpi = ((320 / 32 * np.array([1, 2, 4])) ** 2 * 3).sum()  # gridpoints per image
-    # weights = np.hstack([gpi * len(labels)  - weights.sum() * 9, weights * 9]) ** 0.5  # prepend gridpoints to start
+    gpi = ((320 / 32 * np.array([1, 2, 4])) ** 2 * 3).sum()  # gridpoints per image
+    weights = np.hstack([gpi * len(labels)  - weights.sum() * 9, weights * 9]) ** 0.5  # prepend gridpoints to start
 
     weights[weights == 0] = 1  # replace empty bins with 1
     weights = 1 / weights  # number of targets per class
@@ -205,16 +272,23 @@ def scale_coords(img1_shape, coords, img0_shape, ratio_pad=None):
     coords[:, [0, 2]] -= pad[0]  # x padding
     coords[:, [1, 3]] -= pad[1]  # y padding
     coords[:, :4] /= gain
-    clip_coords(coords, img0_shape)
+    # clip_coords(coords, img0_shape)
     return coords
 
-
 def clip_coords(boxes, img_shape):
-    # Clip bounding xyxy bounding boxes to image shape (height, width)
-    boxes[:, 0].clamp_(0, img_shape[1])  # x1
-    boxes[:, 1].clamp_(0, img_shape[0])  # y1
-    boxes[:, 2].clamp_(0, img_shape[1])  # x2
-    boxes[:, 3].clamp_(0, img_shape[0])  # y2
+    # Clip bounding xywha bounding boxes to image shape (height, width)
+    coors = torch.stack([get_rotated_coors(box[:5]) for box in boxes])
+    clipx = (coors[:,::2] <img_shape[1]).all(1) # clip x
+    clipy = (coors[:,1::2]<img_shape[0]).all(1) # clip y
+    clip = clipx*clipy
+    boxes = boxes[clip]
+
+# def clip_coords(boxes, img_shape):
+#     # Clip bounding xyxy bounding boxes to image shape (height, width)
+#     boxes[:, 0].clamp_(0, img_shape[1])  # x1
+#     boxes[:, 1].clamp_(0, img_shape[0])  # y1
+#     boxes[:, 2].clamp_(0, img_shape[1])  # x2
+#     boxes[:, 3].clamp_(0, img_shape[0])  # y2
 
 
 def ap_per_class(tp, conf, pred_cls, target_cls):
@@ -308,6 +382,40 @@ def compute_ap(recall, precision):
 
     return ap
 
+# 输入的是xywha
+# 支持输入单个的box和多box tensor的iou计算，其中默认box1为单个的
+def skew_bbox_iou(box1, box2, GIoU=False):
+    ft = torch.cuda.FloatTensor 
+    if isinstance(box1,list):  box1 = ft(box1)
+    if isinstance(box2,list):  box2 = ft(box2)
+    if len(box1.shape) < len(box2.shape):   # 输入的单box维度不匹配时，unsqueeze一下
+        box1 = box1.unsqueeze(0)
+    if not box1.shape == box2.shape:
+        box1 = box1.repeat(len(box2),1)
+
+    box1 = box1[:,:5]
+    box2 = box2[:,:5]
+
+    if GIoU: 
+        mode = 'giou'
+    else: 
+        mode = 'iou'
+    
+    ious = []
+    for i in range(len(box2)):
+        r_b1 = get_rotated_coors(box1[i])
+        r_b2 = get_rotated_coors(box2[i])
+        
+        ious.append(skewiou(r_b1, r_b2, mode=mode))
+
+    # if GIoU:  # Generalized IoU https://arxiv.org/pdf/1902.09630.pdf
+    #     c_x1, c_x2 = torch.min(b1_x1, b2_x1), torch.max(b1_x2, b2_x2)
+    #     c_y1, c_y2 = torch.min(b1_y1, b2_y1), torch.max(b1_y2, b2_y2)
+    #     c_area = (c_x2 - c_x1) * (c_y2 - c_y1)  # convex area
+    #     return iou - (c_area - union_area) / c_area  # GIoU
+
+    return ft(ious)
+
 
 def bbox_iou(box1, box2, x1y1x2y2=True, GIoU=False, DIoU=False, CIoU=False):
     # Returns the IoU of box1 to box2. box1 is 4, box2 is nx4
@@ -380,14 +488,30 @@ def box_iou(box1, box2):
     return inter / (area1[:, None] + area2 - inter)  # iou = inter / (area1 + area2 - inter)
 
 
-def wh_iou(wh1, wh2):
-    # Returns the nxm IoU matrix. wh1 is nx2, wh2 is mx2
-    wh1 = wh1[:, None]  # [N,1,2]
-    wh2 = wh2[None]  # [1,M,2]
-    inter = torch.min(wh1, wh2).prod(2)  # [N,M]
-    return inter / (wh1.prod(2) + wh2.prod(2) - inter)  # iou = inter / (area1 + area2 - inter)
+# def wh_iou(wh1, wh2):
+#     # Returns the nxm IoU matrix. wh1 is nx2, wh2 is mx2
+#     wh1 = wh1[:, None]  # [N,1,2]
+#     wh2 = wh2[None]  # [1,M,2]
+#     inter = torch.min(wh1, wh2).prod(2)  # [N,M]
+#     return inter / (wh1.prod(2) + wh2.prod(2) - inter)  # iou = inter / (area1 + area2 - inter)
 
+def wh_iou(box1, box2):
+    # Returns the IoU of wh1 to wh2. wh1 is 2, wh2 is nx2
+    if box1.shape != box2.shape:
+        box2 = box2.t()
+        # w, h = box1
+        w1, h1 = box1[0], box1[1]
+        w2, h2 = box2[0], box2[1]
+    else:
+        w1, h1 = box1[:,0], box1[:,1]
+        w2, h2 = box2[:,0], box2[:,1]
+    # Intersection area
+    inter_area = torch.min(w1, w2) * torch.min(h1, h2)
 
+    # Union Area
+    union_area = (w1 * h1 + 1e-16) + w2 * h2 - inter_area
+    return inter_area / union_area  # iou
+    
 class FocalLoss(nn.Module):
     # Wraps focal loss around existing loss_fcn(), i.e. criteria = FocalLoss(nn.BCEWithLogitsLoss(), gamma=1.5)
     def __init__(self, loss_fcn, gamma=1.5, alpha=0.25):
